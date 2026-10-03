@@ -514,6 +514,66 @@ static void ReplaceMOVNTSD(void* address, const ZydisDecodedOperand*, Xbyak::Cod
     ReplaceMOVNT(address, 0xF2);
 }
 
+#if defined(__APPLE__)
+// Rosetta 2 mistranslates VCMPSS with NEQ, NLT or NLE: if the destination is then reloaded by a
+// full width VEX load, later scalar reads of it still return the compare mask.
+static bool FilterNegatedScalarCompare(const ZydisDecodedOperand* operands) {
+    if (operands[3].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        return false;
+    }
+    switch (operands[3].imm.value.u) {
+    case 4:  // NEQ_UQ
+    case 5:  // NLT_US
+    case 6:  // NLE_US
+    case 20: // NEQ_US
+    case 21: // NLT_UQ
+    case 22: // NLE_UQ
+        return true;
+    default:
+        return false;
+    }
+}
+
+static Xbyak::Address RelocatedMemoryOperand(void* address, const ZydisDecodedOperand& operand) {
+    if (operand.mem.base != ZYDIS_REGISTER_RIP && operand.mem.base != ZYDIS_REGISTER_EIP) {
+        return ZydisToXbyakMemoryOperand(operand);
+    }
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status = Common::Decoder::Instance()->decodeInstruction(
+        instruction, operands, address, ZYDIS_MAX_INSTRUCTION_LENGTH);
+    ASSERT(ZYAN_SUCCESS(status));
+    ZyanU64 target{};
+    ASSERT(ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&instruction, &operand,
+                                                 reinterpret_cast<ZyanU64>(address), &target)));
+    return ptr[rip + reinterpret_cast<const void*>(target)];
+}
+
+// Compares with the non-negated predicate and flips lane 0, which gives the same bits.
+static void GenerateNegatedScalarCompare(void* address, const ZydisDecodedOperand* operands,
+                                         Xbyak::CodeGenerator& c) {
+    const auto dst = ZydisToXbyakRegisterOperand(operands[0]);
+    const auto src1 = ZydisToXbyakRegisterOperand(operands[1]);
+    const auto& xmm_dst = *reinterpret_cast<const Xbyak::Xmm*>(&dst);
+    const auto& xmm_src1 = *reinterpret_cast<const Xbyak::Xmm*>(&src1);
+    const u8 predicate = operands[3].imm.value.u & 3;
+    if (operands[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        c.vcmpss(xmm_dst, xmm_src1, ZydisToXbyakRegisterOperand(operands[2]), predicate);
+    } else {
+        c.vcmpss(xmm_dst, xmm_src1, RelocatedMemoryOperand(address, operands[2]), predicate);
+    }
+    Xbyak::Label lane0_mask, done;
+    c.vxorps(xmm_dst, xmm_dst, ptr[rip + lane0_mask]);
+    c.jmp(done);
+    c.L(lane0_mask);
+    c.dd(0xFFFFFFFF);
+    c.dd(0);
+    c.dd(0);
+    c.dd(0);
+    c.L(done);
+}
+#endif
+
 using PatchFilter = bool (*)(const ZydisDecodedOperand*);
 using InstructionGenerator = void (*)(void*, const ZydisDecodedOperand*, Xbyak::CodeGenerator&);
 struct PatchInfo {
@@ -542,7 +602,10 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
     {ZYDIS_MNEMONIC_MOVNTSS, {{FilterNoSSE4a, ReplaceMOVNTSS, false}}},
     {ZYDIS_MNEMONIC_MOVNTSD, {{FilterNoSSE4a, ReplaceMOVNTSD, false}}},
 
-#if !defined(__APPLE__)
+#if defined(__APPLE__)
+    // Rosetta 2
+    {ZYDIS_MNEMONIC_VCMPSS, {{FilterNegatedScalarCompare, GenerateNegatedScalarCompare, true}}},
+#else
     // FS segment patches
     // For most of these, Windows needs a trampoline while other platforms do not.
     {ZYDIS_MNEMONIC_XOR, {{FilterTcbAccess, GenerateTcbExclusiveOr, need_tcb_trampoline}}},
